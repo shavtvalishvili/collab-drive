@@ -31,6 +31,7 @@ const directory = path.resolve(directoryPath);
 if (!fs.existsSync(directory)) {
   fs.mkdirSync(directory, { recursive: true });
 }
+
 let cacheDirectory = null;
 
 // Set up our drive key
@@ -46,78 +47,75 @@ console.log(
 // State
 const ydoc = new Y.Doc();
 const fileMap = ydoc.getMap('files');
-const lastSyncedChangeHashes = new Map(); // key: relPath, value: Set of hash strings
+const lastSyncedChangeHashes = new Map();
 let isSynced = !driveKeyHex;
 let isSyncing = false;
 let bufferedChanges = [];
 let serverHyperdrive = null;
 let swarmForSharing = null;
 
-const mirrorFromRemoteDrive = async (received_object, socket) => {
-  console.log('Mirror directory from an existing peer');
-  const driveKeyBuffer = b4a.from(received_object.key, 'hex');
-  const corestore = new Corestore(path.resolve(cacheDirectory), {
-    writable: true,
-  });
+const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
 
-  const hyperdrive = new Hyperdrive(corestore, driveKeyBuffer);
+const createCorestore = async () => {
+  const ownKeyHex = b4a.toString(swarm.dht.defaultKeyPair.publicKey, 'hex');
+  cacheDirectory = path.join(path.dirname(directory), `.${ownKeyHex}`);
+  return new Corestore(path.resolve(cacheDirectory), { writable: true });
+};
+
+const mirrorFromRemoteDrive = async (receivedKeyHex, socket) => {
+  console.log('Mirror directory from an existing peer');
+  const key = b4a.from(receivedKeyHex, 'hex');
+  const corestore = await createCorestore();
+  const hyperdrive = new Hyperdrive(corestore, key);
   await hyperdrive.ready();
 
-  try {
-    const swarmForReceiving = new Hyperswarm();
-    const done = hyperdrive.findingPeers();
+  const swarmForReceiving = new Hyperswarm();
+  const done = hyperdrive.findingPeers();
+  // TODO: Add timeout for safety
+  swarmForReceiving.on('connection', (mirrorSocket) =>
+    hyperdrive.replicate(mirrorSocket)
+  );
+  swarmForReceiving.join(hyperdrive.discoveryKey);
+  await swarmForReceiving.flush();
+  await done();
 
-    // TODO: Add timeout
-    swarmForReceiving.on('connection', (mirrorSocket) => {
-      hyperdrive.replicate(mirrorSocket);
-    });
+  const local = new Localdrive(directory);
+  const mirrordrive = hyperdrive.mirror(local);
 
-    const discoveryKey = hyperdrive.discoveryKey;
-    swarmForReceiving.join(discoveryKey);
-    console.log('Discovery key', discoveryKey);
-    await swarmForReceiving.flush();
-    await done();
-
-    const local = new Localdrive(directory);
-    const mirrordrive = hyperdrive.mirror(local);
-
-    const fileKeys = [];
-    for await (const diff of mirrordrive) {
-      fileKeys.push(diff.key);
-    }
-    for (const fileKey of fileKeys) {
-      if (fs.existsSync(directory + fileKey)) {
-        const data = await fs.promises.readFile(directory + fileKey);
-        const hash = sha256(data);
-        if (!lastSyncedChangeHashes.has(fileKey)) {
-          lastSyncedChangeHashes.set(fileKey, new Set());
-        }
-        lastSyncedChangeHashes.get(fileKey).add(hash);
-      }
-    }
-
-    await hyperdrive.close();
-    await swarmForReceiving.destroy();
-
-    socket.write(JSON.stringify({ type: 'mirror-complete' }));
-    applyBufferedChanges();
-    isSyncing = false;
-    isSynced = true;
-  } catch (e) {
-    console.log(e);
+  const fileKeys = [];
+  for await (const diff of mirrordrive) {
+    fileKeys.push(diff.key);
   }
+  for (const fileKey of fileKeys) {
+    if (fs.existsSync(directory + fileKey)) {
+      const data = await fs.promises.readFile(directory + fileKey);
+      const hash = sha256(data);
+      if (!lastSyncedChangeHashes.has(fileKey)) {
+        lastSyncedChangeHashes.set(fileKey, new Set());
+      }
+      lastSyncedChangeHashes.get(fileKey).add(hash);
+    }
+  }
+
+  await hyperdrive.close();
+  await swarmForReceiving.destroy();
+
+  socket.write(JSON.stringify({ type: 'mirror-complete' }));
+  applyBufferedChanges();
+  isSyncing = false;
+  isSynced = true;
 };
 
 const mirrorToRemoteDrive = async (socket) => {
   console.log('Mirror directory to a new peer');
-  const corestore = new Corestore(path.resolve(cacheDirectory), {
-    writable: true,
-  });
-  serverHyperdrive = new Hyperdrive(corestore, undefined);
+  const corestore = await createCorestore();
+  serverHyperdrive = new Hyperdrive(corestore);
   await serverHyperdrive.ready();
+
   const local = new Localdrive(directory);
   await local.ready();
   await local.mirror(serverHyperdrive).done();
+
   swarmForSharing = new Hyperswarm();
   const done = serverHyperdrive.findingPeers();
   swarmForSharing.on('connection', (mirrorSocket) =>
@@ -129,59 +127,88 @@ const mirrorToRemoteDrive = async (socket) => {
   await done();
 
   const hyperDriveKey = b4a.toString(serverHyperdrive.key, 'hex');
-  socket.write(JSON.stringify({ type: 'drive-key', key: hyperDriveKey }));
+  socket.write(JSON.stringify({ type: 'drive-key', value: hyperDriveKey }));
 };
 
 const applyBufferedChanges = () => {
-  bufferedChanges.forEach((data) => {
-    Y.applyUpdate(ydoc, data);
-  });
+  bufferedChanges.forEach((data) => Y.applyUpdate(ydoc, data));
   bufferedChanges = [];
 };
 
-const handleJsonData = (received_object, socket) => {
-  console.log('Received json data', received_object);
-  if (isSynced) {
-    if (received_object.type === 'mirror-approval') {
+const handleSyncedState = (type, socket) => {
+  switch (type) {
+    case 'mirror-approval':
       isSyncing = true;
       void mirrorToRemoteDrive(socket);
-    } else if (received_object.type === 'mirror-complete') {
-      (async () => {
-        await serverHyperdrive.close();
-        await swarmForSharing.destroy();
-        applyBufferedChanges();
-        isSyncing = false;
+      break;
+
+    case 'mirror-complete':
+      void (async () => {
+        try {
+          await serverHyperdrive.close();
+          await swarmForSharing.destroy();
+        } catch (err) {
+          console.error('Error during mirror-complete cleanup:', err);
+        } finally {
+          applyBufferedChanges();
+          isSyncing = false;
+        }
       })();
-    }
-  } else {
-    if (received_object.type === 'mirror-proposal') {
-      if (isSyncing) {
-        socket.write(JSON.stringify({ type: 'mirror-denial' }));
-      } else {
-        socket.write(JSON.stringify({ type: 'mirror-approval' }));
+      break;
+
+    default:
+      console.warn('Unexpected message type in synced state:', type);
+  }
+};
+
+const handleUnsyncedState = (type, value, socket) => {
+  switch (type) {
+    // ToDo: Implement timeout and restart for getting a mirror-proposal request
+    case 'mirror-proposal':
+      const responseType = isSyncing ? 'mirror-denial' : 'mirror-approval';
+      socket.write(JSON.stringify({ type: responseType }));
+      if (!isSyncing) {
         isSyncing = true;
       }
-    } else if (received_object.type === 'drive-key') {
-      void mirrorFromRemoteDrive(received_object, socket);
-    }
+      break;
+
+    case 'drive-key':
+      void mirrorFromRemoteDrive(value, socket);
+      break;
+
+    default:
+      console.warn('Unexpected message type in unsynced state:', type);
+  }
+};
+
+const handleJsonData = (received_object, socket) => {
+  console.log('Received JSON data', received_object);
+
+  if (!received_object || typeof received_object !== 'object') {
+    console.warn('Invalid JSON data received.');
+    return;
+  }
+
+  const { type, value } = received_object;
+
+  if (isSynced) {
+    handleSyncedState(type, socket);
+  } else {
+    handleUnsyncedState(type, value, socket);
   }
 };
 
 const swarm = new Hyperswarm();
-const ownPublicKey = b4a.toString(swarm.dht.defaultKeyPair.publicKey, 'hex');
-cacheDirectory = path.join(path.dirname(directory), '.' + ownPublicKey);
-swarm.on('connection', (socket, peerInfo) => {
+swarm.on('connection', (socket) => {
   console.log('New peer connected');
-  if (isSynced) {
+  if (isSynced && !isSyncing)
     socket.write(JSON.stringify({ type: 'mirror-proposal' }));
-  }
 
   // Receive updates from peers
   socket.on('data', (data) => {
     try {
       const received_object = JSON.parse(b4a.from(data));
-      handleJsonData(received_object, socket, peerInfo);
-      return;
+      return handleJsonData(received_object, socket);
     } catch {
       console.log('Received raw buffer object');
     }
@@ -198,23 +225,23 @@ swarm.on('connection', (socket, peerInfo) => {
   });
 
   // Send local updates to peers
-  const sendUpdate = (update) => {
-    socket.write(update);
-  };
-
+  // ToDo: encrypt data
+  const sendUpdate = (update) => socket.write(update);
   ydoc.on('update', sendUpdate);
 
   socket.on('close', () => {
     ydoc.off('update', sendUpdate);
     console.log('Peer disconnected');
   });
+
   socket.on('error', (error) => {
     ydoc.off('update', sendUpdate);
     console.error('Socket error:', error);
   });
 });
+
 await swarm.join(driveKey, { lookup: true, announce: true }).flushed();
-console.log('🔗 Swarm joined. Awaiting peers…');
+console.log('Swarm joined. Awaiting peers…');
 
 // Monitor local filesystem changes
 const watch = chokidar.watch(directory, {
@@ -224,11 +251,10 @@ const watch = chokidar.watch(directory, {
   persistent: true,
   awaitWriteFinish: true,
 });
-watch.on('all', async (event, filePath) => {
-  if (micromatch.isMatch(filePath, TEMP_FILE_GLOBS)) {
-    return;
-  }
 
+watch.on('all', async (event, filePath) => {
+  if (!isSynced) return;
+  if (micromatch.isMatch(filePath, TEMP_FILE_GLOBS)) return;
   const relPath = '/' + path.relative(directory, filePath).replace(/\\/g, '/');
 
   try {
@@ -238,73 +264,51 @@ watch.on('all', async (event, filePath) => {
 
       if (lastSyncedChangeHashes.has(relPath)) {
         const hashes = lastSyncedChangeHashes.get(relPath);
-        if (hashes.has(newHash)) {
-          // No actual change, just sync, skip
-          hashes.delete(newHash);
-          if (hashes.size === 0) {
-            lastSyncedChangeHashes.delete(relPath);
-          }
-          return;
-        }
+        if (hashes.delete(newHash)) return;
+        if (hashes.size === 0) lastSyncedChangeHashes.delete(relPath);
       }
 
-      const timestamp = Date.now();
-      ydoc.transact(() => {
-        fileMap.set(relPath, { data, timestamp });
-      }, LOCAL_ORIGIN);
-      console.log(`↑ ${event.toUpperCase()}: ${relPath}`);
+      ydoc.transact(
+        () => fileMap.set(relPath, { data, timestamp: Date.now() }),
+        LOCAL_ORIGIN
+      );
+      console.log(`${event.toUpperCase()}: ${relPath}`);
     } else if (event === 'unlink') {
       fileMap.delete(relPath);
-      console.log(`✖ DELETE: ${relPath}`);
+      console.log(`DELETE: ${relPath}`);
     }
   } catch (err) {
     console.error('Sync to drive error:', err);
   }
 });
 
-const sha256 = (data) => {
-  return crypto.createHash('sha256').update(data).digest('hex');
-};
-// Apply remote changes to local filesystem
 fileMap.observe((event, transaction) => {
   if (transaction.origin === LOCAL_ORIGIN) return; // Ignore local changes
 
   event.changes.keys.forEach((change, key) => {
     const filePath = path.join(directory, key);
-    let hash = null;
-    if (change.action === 'add' || change.action === 'update') {
-      const { data } = fileMap.get(key);
-      hash = sha256(data);
+    let content =
+      change.action === 'delete' ? b4a.from('') : fileMap.get(key).data;
+    const op =
+      change.action === 'delete'
+        ? fs.promises.unlink(filePath)
+        : fs.promises.writeFile(filePath, content);
 
-      fs.writeFile(filePath, data, 'utf8', (err) => {
-        if (err) {
-          console.error('Error writing file:', err);
-        }
-      });
-    } else if (change.action === 'delete') {
-      hash = sha256(b4a.from(''));
-      fs.unlink(filePath, (err) => {
-        if (err && err.code !== 'ENOENT') {
-          console.error('Error deleting file:', err);
-        }
-      });
-    }
+    op.catch(
+      (err) =>
+        err.code !== 'ENOENT' && console.error('Error writing file:', err)
+    );
 
-    if (hash) {
-      if (!lastSyncedChangeHashes.has(key)) {
-        lastSyncedChangeHashes.set(key, new Set());
-      }
-      const hashes = lastSyncedChangeHashes.get(key);
-      hashes.add(hash);
+    const hash = sha256(content);
+    if (!lastSyncedChangeHashes.has(key)) {
+      lastSyncedChangeHashes.set(key, new Set());
     }
+    lastSyncedChangeHashes.get(key).add(hash);
   });
 });
 
 teardown(async () => {
   await swarm.destroy();
   watch.close();
-  fs.rmSync(cacheDirectory, {
-    force: true,
-    recursive: true,
-  });
+  fs.rmSync(cacheDirectory, { force: true, recursive: true });
 });
