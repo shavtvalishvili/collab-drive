@@ -1,0 +1,21 @@
+# package.json
+
+## exports["."] + ->
+"require": "./index.js",
+"bare":    "./index.js",
+"addon":   "./binding.js",
+
+# exports["./promises"] + ->
+"bare":    "./promises.js",
+"addon":   "./binding.js",
+
+# index.js
+
+## + ->
+// stub out deprecated APIs
+exports.watchFile = function watchFile(path, listener) {
+  console.warn(`fs.watchFile stub called on ${path} with listener ${listener}`);
+};
+exports.unwatchFile = function unwatchFile(path, listener) {
+  console.warn(`fs.watchFile stub called on ${path} with listener ${listener}`);
+};
